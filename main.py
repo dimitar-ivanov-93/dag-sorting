@@ -1,6 +1,8 @@
 from collections import defaultdict
 from typing import List, Tuple, Dict, Union
 import argparse, logging
+from collections import deque
+from tabulate import tabulate
 
 logging.basicConfig(filename='error.log', level=logging.ERROR, format='%(asctime)s %(levelname)s:%(message)s')
 
@@ -77,45 +79,79 @@ def reorder_tasks(pipeline_list: List[List[Union[str, int, List[str]]]]) -> List
     return pipeline_list
 
 
-def execution(groups: List[List[Union[str, int, List[str]]]], cpu_power: int) -> List[Tuple[str, List[List[Union[str, int, List[str]]]]]]:
-    execution_map = []
-    no_group_tasks = [task for group in groups if group[0][0] == 'no_group' for task in group[1:]]
-    for group in groups:
-        if group[0][0] == 'no_group':
-            continue
-        tasks = group[1:]
-        while tasks:
-            current_tasks = []
-            for _ in range(cpu_power):
-                if tasks and (not current_tasks or tasks[0][2] == [] or set(tasks[0][2]).isdisjoint(set(t[0] for t in current_tasks))):
-                    current_task = tasks[0]
-                    current_task[1] -= 1
-                    if current_task[1] == 0:
-                        tasks.pop(0)
-                    current_tasks.append(current_task)
-                elif no_group_tasks and (not current_tasks or no_group_tasks[0][2] == [] or set(no_group_tasks[0][2]).isdisjoint(set(t[0] for t in current_tasks))):
-                    current_task = no_group_tasks[0]
-                    current_task[1] -= 1
-                    if current_task[1] == 0:
-                        no_group_tasks.pop(0)
-                    current_tasks.append(current_task)
-            execution_map.append((group[0][0], current_tasks))
+def execute_tasks(task_list: List[List[Union[str, int, List[str]]]], cpu_count: int) -> List[Tuple[int, List[str], str]]:
+    # Initialize variables
+    task_time_remaining = {}
+    completed_tasks = set()
+    no_group_tasks = [task for task in task_list if task[0][0] == 'no_group']
+    no_group_tasks = no_group_tasks[0][1:] if no_group_tasks else []
+    task_list = [family for family in task_list if family[0][0] != 'no_group']
 
-    # Execute remaining no_group_tasks
-    while no_group_tasks:
-        current_tasks = []
-        for _ in range(cpu_power):
-            if no_group_tasks and (not current_tasks or no_group_tasks[0][2] == [] or set(no_group_tasks[0][2]).isdisjoint(set(t[0] for t in current_tasks))):
-                current_task = no_group_tasks[0]
-                current_task[1] -= 1
-                if current_task[1] == 0:
-                    no_group_tasks.pop(0)
-                current_tasks.append(current_task)
-        execution_map.append(('no_group', current_tasks))
+    # Add all tasks to the time remaining dictionary
+    for family in task_list:
+        for task in family[1:]:
+            task_time_remaining[task[0]] = task[1]
+    for task in no_group_tasks:
+        task_time_remaining[task[0]] = task[1]
+
+    # Initialize the execution map
+    execution_map = []
+
+    # Process tasks
+    minute = 0
+    family_index = 0
+    while family_index < len(task_list) or task_time_remaining:
+        minute += 1
+        next_minute_tasks = []
+        current_minute_tasks = set()
+
+        # Process tasks in the current family
+        if family_index < len(task_list):
+            for task in task_list[family_index][1:]:
+                if task[0] in completed_tasks:
+                    continue
+                if all(dep in completed_tasks for dep in task[2]) and all(dep not in current_minute_tasks for dep in task[2]):
+                    next_minute_tasks.append(task[0])
+                    current_minute_tasks.add(task[0])
+                    task_time_remaining[task[0]] -= 1
+
+                    # If the task is completed, add it to the completed tasks set
+                    if task_time_remaining[task[0]] == 0:
+                        completed_tasks.add(task[0])
+                        del task_time_remaining[task[0]]
+
+                    # If we have reached the CPU limit, stop adding tasks
+                    if len(next_minute_tasks) == cpu_count:
+                        break
+
+            # If all tasks in the current family are completed, move to the next family
+            if all(task[0] in completed_tasks for task in task_list[family_index][1:]):
+                family_index += 1
+
+        # Check if we can add a task from the 'no_group' family
+        if len(next_minute_tasks) < cpu_count and no_group_tasks:
+            task = no_group_tasks[0]
+            if all(dep in completed_tasks for dep in task[2]) and all(dep not in current_minute_tasks for dep in task[2]):
+                next_minute_tasks.append(task[0])
+                current_minute_tasks.add(task[0])
+                task_time_remaining[task[0]] -= 1
+
+                # If the task is completed, add it to the completed tasks set
+                if task_time_remaining[task[0]] == 0:
+                    completed_tasks.add(task[0])
+                    del task_time_remaining[task[0]]
+                    no_group_tasks.remove(task)
+
+        # Add the current tasks to the execution map
+        group_name = task_list[family_index][0][0] if family_index < len(task_list) else 'no_group'
+        execution_map.append((minute, next_minute_tasks, group_name))
+
+        # If no tasks were scheduled this minute, break the loop
+        if not next_minute_tasks:
+            break
 
     return execution_map
-
-
+    
 def check_positive(value: str) -> int:
     ivalue = int(value)
     if ivalue < 1:
@@ -133,20 +169,31 @@ def main() -> None:
     if not pipeline_list:
         return
     reordered_pipeline_list = reorder_tasks(pipeline_list)
-    execution_map = execution(reordered_pipeline_list, args.cpu_cores)
+    execution_map = execute_tasks(reordered_pipeline_list, args.cpu_cores)
 
     # Calculate the maximum length of the tasks string
-    max_tasks_length = max(len(', '.join(task[0] for task in tasks)) for _, tasks in execution_map)
+    max_tasks_length = max(len(', '.join(tasks)) for _, tasks, _ in execution_map)
 
-    print("| Time    | Tasks being Executed | Group Name")
-    print("| ------- | {0} | ----------".format('-' * max_tasks_length))
-    min_time = 0
-    for i, (group_name, tasks) in enumerate(execution_map, start=1):
-        min_time += 1
-        tasks_str = ', '.join(task[0] for task in tasks)
-        print("| {:<6}  | {:<{}} | {:<10}".format(i, tasks_str, max_tasks_length, group_name if group_name != "no_group" else ""))
+    # Calculate the maximum length of the group name string
+    max_group_name_length = max(len(group_name) for _, _, group_name in execution_map)
 
-    print(f"\nMinimum Execution Time = {min_time} minutes.")
+    # Calculate the maximum length for each column
+    max_time_length = max(len(str(minute)) for minute, _, _ in execution_map)
+    max_tasks_length = max(max_tasks_length, len("Tasks being Executed"))
+    max_group_name_length = max(max_group_name_length, len("Group Name"))
+
+    # Add spaces to the headers to match the maximum length of each column
+    header_time = "Time" + ' ' * (max_time_length - len("Time"))
+    header_tasks = "Tasks being Executed" + ' ' * (max_tasks_length - len("Tasks being Executed"))
+    header_group = "Group Name" + ' ' * (max_group_name_length - len("Group Name"))
+
+    print(f"| {header_time} | {header_tasks} | {header_group}")
+    print(f"| {'-' * (max_time_length+1)} | {'-' * max_tasks_length} | {'-' * max_group_name_length}")
+    for minute, tasks, group_name in execution_map:
+        tasks_str = ', '.join(tasks)
+        print(f"| {minute:<{(max_time_length+1)}} | {tasks_str:<{max_tasks_length}} | {group_name if group_name != 'no_group' else '':<{max_group_name_length}}")
+
+    print(f"\nMinimum Execution Time = {minute} minutes.")
 
 if __name__ == "__main__":
     main()
